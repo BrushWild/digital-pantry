@@ -1,0 +1,36 @@
+# Digital Pantry — digest drain poller.
+#
+# A long-lived SpacetimeDB *client* (not a server). It connects to the live
+# `digital-pantry` database over WebSocket via the official `spacetimedb-sdk`,
+# subscribes to the `digest_outbox` table, delivers each pending outbox row to
+# its channel (Discord/Telegram/WhatsApp webhook), and acks by invoking the
+# `mark_outbox_delivered` reducer.
+#
+# Build (native, not wasm):
+#   cargo build --release
+#
+# Run:
+#   SPACETIMEDB_HOST=wss://maincloud.spacetimedb.com \
+#   SPACETIMEDB_DB_NAME=digital-pantry \
+#   DIGEST_POLLER_MODE=dry-run \
+#   ./target/release/digest_poller
+#
+# `DIGEST_POLLER_MODE=dry-run` logs deliveries instead of posting webhooks —
+# use it to verify the connect/subscribe/ack loop end-to-end without
+# spamming real channels. Set to `live` for real webhook delivery.
+
+[package]
+name = "digest-poller"
+version = "0.1.0"
+edition = "2021"
+description = "Drains the Digital Pantry digest_outbox queue and delivers to chat channels"
+
+[[bin]]
+name = "digest_poller"
+path = "src/main.rs"
+
+[dependencies]
+spacetimedb-sdk = "2.8.2"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "blocking"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
