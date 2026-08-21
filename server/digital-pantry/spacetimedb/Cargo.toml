@@ -3,9 +3,11 @@ name = "digital_pantry"
 version = "0.1.0"
 edition = "2024"
 
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-spacetimedb = { version = "2.1.0" }
+spacetimedb = { version = "2.8.2" }
 log = "0.4"
