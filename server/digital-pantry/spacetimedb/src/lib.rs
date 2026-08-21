@@ -261,6 +261,36 @@ pub struct DigestSubscription {
     pub subscribed_at: i64,
 }
 
+/// A queued digest delivery. The wasm module can't make outbound network
+/// calls, so `send_digest` composes the digest and writes one outbox row per
+/// active subscription *endpoint*. A networked poller (the Hermes gateway)
+/// reads rows where `is_delivered = false`, sends via the channel, then acks
+/// with `mark_outbox_delivered`. Per-endpoint rows mean one failed delivery
+/// never blocks the others, and an undelivered row simply waits until the
+/// next drain — the outbox is a durable queue.
+#[derive(Clone)]
+#[table(accessor = digest_outbox, public)]
+pub struct DigestOutbox {
+    #[primary_key]
+    #[auto_inc]
+    pub outbox_id: u64,
+
+    /// FK → DigestSubscription.subscription_id this delivery is for.
+    #[index(btree)]
+    pub subscription_id: u64,
+    /// Delivery channel: "discord" | "telegram" | "whatsapp".
+    pub channel: String,
+    /// Channel-specific handle to deliver to.
+    pub handle: String,
+    /// Rendered digest message body (markdown).
+    pub message: String,
+    /// How many expiring items this digest reported.
+    pub item_count: u32,
+    /// Has the networked poller delivered (and acked) this row yet?
+    pub is_delivered: bool,
+    pub created_at: Timestamp,
+}
+
 /// An event log entry for audit trail and analytics.
 #[derive(Clone)]
 #[table(accessor = pantry_event, public)]
@@ -303,6 +333,23 @@ pub struct ExpirySweepSchedule {
     pub scheduled_at: ScheduleAt,
 }
 
+/// Scheduling table for the weekly expiration digest.
+///
+/// Same timer-table mechanism as `ExpirySweepSchedule`. `init` arms a weekly
+/// repeating loop; when it fires the `send_digest` reducer composes the
+/// digest from `ExpiringSoon` items and fans it out to the outbox. Also
+/// callable manually (e.g. "send me a digest now").
+#[derive(Clone)]
+#[table(accessor = digest_schedule, scheduled(send_digest))]
+pub struct DigestSchedule {
+    /// 0 = repeating interval row (created once by init); non-zero = one-shot.
+    #[primary_key]
+    #[auto_inc]
+    pub scheduled_id: u64,
+    /// When the digest should run (interval or one-shot time).
+    pub scheduled_at: ScheduleAt,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Reducers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -324,6 +371,17 @@ pub fn init(ctx: &ReducerContext) {
             scheduled_at: interval.into(),
         });
         log::info!("Armed expiry sweep: every 30 minutes.");
+    }
+
+    // Arm the weekly expiration digest. Same guard: one repeating row only.
+    let digest_armed: Vec<DigestSchedule> = ctx.db.digest_schedule().iter().collect();
+    if digest_armed.is_empty() {
+        let week = std::time::Duration::from_secs(7 * 24 * 3600); // 7 days
+        ctx.db.digest_schedule().insert(DigestSchedule {
+            scheduled_id: 0, // 0 = repeating interval
+            scheduled_at: week.into(),
+        });
+        log::info!("Armed weekly expiration digest.");
     }
 }
 
@@ -777,6 +835,112 @@ pub fn unsubscribe_digest(ctx: &ReducerContext, subscription_id: u64) -> Result<
         ..sub
     });
     Ok(())
+}
+
+// ── Expiration digest (scheduled fan-out) ───────────────────────────────────
+
+/// Compose the expiration digest and fan it out to every active subscription
+/// endpoint.
+///
+/// Reads all `Item`s flagged `ExpiringSoon`, ranks them most-urgent first
+/// (nearest expiry, then name), renders a markdown digest, and — because the
+/// wasm module has no outbound network — writes **one `DigestOutbox` row per
+/// active `DigestSubscription` endpoint**. The networked Hermes gateway drains
+/// that outbox and calls `mark_outbox_delivered` once each message lands.
+///
+/// Running it with nothing expiring writes no rows and logs a no-op, so the
+/// weekly loop is cheap on a quiet pantry. Also callable on demand by a client.
+#[reducer]
+pub fn send_digest(ctx: &ReducerContext, _arg: DigestSchedule) -> Result<(), String> {
+    let now = now_ts(ctx);
+    let mut expiring: Vec<Item> = ctx.db.item().iter()
+        .filter(|i| i.status == ItemStatus::ExpiringSoon && i.quantity > 0.0)
+        .collect();
+    if expiring.is_empty() {
+        log::info!("Digest: no ExpiringSoon items; skipped fan-out.");
+        return Ok(());
+    }
+
+    // Most-urgent first: soonest expiry, then by name for stable output.
+    expiring.sort_by(|a, b| {
+        a.est_expiry_ts
+            .cmp(&b.est_expiry_ts)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    // Render the message once — identical body for every endpoint.
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!(
+        "🥚 **Pantry expiry digest** — {} item{} expiring soon:",
+        expiring.len(),
+        if expiring.len() == 1 { "" } else { "s" }
+    ));
+    for item in &expiring {
+        lines.push(format!("- {}", expiry_line(item, now)));
+    }
+    lines.push("\nFull list in the pantry UI.".to_string());
+    let message = lines.join("\n");
+
+    // Fan out: one outbox row per active endpoint.
+    let subs: Vec<DigestSubscription> = ctx.db.digest_subscription().iter()
+        .filter(|s| s.is_active)
+        .collect();
+    if subs.is_empty() {
+        log::info!("Digest composed but no active subscriptions; nothing enqueued.");
+        return Ok(());
+    }
+    let item_count = expiring.len() as u32;
+    for sub in &subs {
+        ctx.db.digest_outbox().insert(DigestOutbox {
+            outbox_id: 0, // auto_inc
+            subscription_id: sub.subscription_id,
+            channel: sub.channel.clone(),
+            handle: sub.handle.clone(),
+            message: message.clone(),
+            item_count,
+            is_delivered: false,
+            created_at: ctx.timestamp,
+        });
+    }
+    log_event(ctx, "digest_sent", 0, format!(
+        "Composed digest with {} expiring item(s); enqueued {} endpoint(s).",
+        item_count, subs.len()
+    ));
+    Ok(())
+}
+
+/// Ack a delivered outbox row. Called by the networked gateway after it sends
+/// the message. The row is kept (with `is_delivered = true`) as delivery
+/// history rather than deleted, so the outbox doubles as a send log.
+#[reducer]
+pub fn mark_outbox_delivered(ctx: &ReducerContext, outbox_id: u64) -> Result<(), String> {
+    let row = ctx.db.digest_outbox().outbox_id().find(&outbox_id)
+        .ok_or("Outbox row not found")?;
+    if !row.is_delivered {
+        ctx.db.digest_outbox().outbox_id().update(DigestOutbox {
+            is_delivered: true,
+            ..row
+        });
+    }
+    Ok(())
+}
+
+/// "Whole Milk 1L — fridge, expires in ~1 day" / "…has passed its expiry".
+fn expiry_line(item: &Item, now: i64) -> String {
+    let loc = match item.location {
+        Location::Fridge => "fridge",
+        Location::Freezer => "freezer",
+        Location::Pantry => "pantry",
+        Location::Counter => "counter",
+        Location::Other => "storage",
+    };
+    let secs = item.est_expiry_ts - now;
+    let expiry = if secs <= 0 {
+        "has passed its estimated expiry".to_string()
+    } else {
+        format!("expires in ~{} day(s)", (secs / 86_400).max(0))
+    };
+    format!("**{}** — {}, {}", item.display_name, loc, expiry)
 }
 
 // ── Expiry sweep (scheduled) ─────────────────────────────────────────────────

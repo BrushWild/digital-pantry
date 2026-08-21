@@ -2,7 +2,7 @@
 
 > **Status:** Draft v1 (compiles clean for `wasm32-unknown-unknown`; `spacetimedb = "2.1.0"` pin resolves to 2.8.2)
 > **Source of truth:** `server/digital-pantry/spacetimedb/src/lib.rs`
-> **Last updated:** 2026-08-21 — expiry sweep wired (scheduled `sweep_expiring_items`, 30-min loop)
+> **Last updated:** 2026-08-21 — expiry sweep wired + weekly digest fan-out (scheduled `send_digest` → `DigestOutbox` queue)
 
 This document explains *what* the schema contains and *why* each design choice
 was made. The Rust module is the authoritative definition — if they disagree,
@@ -24,14 +24,14 @@ either surface propagates to the other instantly — no sync layer needed.
 │ (WASM)      │   reducers    │   SpacetimeDB module     │
 └─────────────┘               │   digital_pantry          │
 ┌─────────────┐   subscribe   │  ┌────────────────────┐  │
-│  Hermes     │◄─────────────►│  │ 10 public tables   │  │
+│  Hermes     │◄─────────────►│  │ 12 public tables   │  │
 │  gateway    │   reducers    │  └────────────────────┘  │
-│ (Discord /  │               │   19 reducers            │
+│ (Discord /  │               │   21 reducers            │
 │  Telegram)  │               └──────────────────────────┘
 └─────────────┘
 ```
 
-## 2. Tables (10)
+## 2. Tables (12)
 
 | Table | PK | Role |
 |---|---|---|
@@ -45,6 +45,8 @@ either surface propagates to the other instantly — no sync layer needed.
 | `DigestSubscription` | `subscription_id` (auto) | Per-endpoint weekly-digest subscriptions. |
 | `PantryEvent` | `event_id` (auto) | Append-only audit trail + analytics source. |
 | `ExpirySweepSchedule` | `scheduled_id` (auto) | SpacetimeDB timer table that drives the "expiring soon" sweep. |
+| `DigestSchedule` | `scheduled_id` (auto) | Timer table that drives the weekly expiration digest. |
+| `DigestOutbox` | `outbox_id` (auto) | Durable per-endpoint delivery queue the gateway drains. |
 
 ### 2.1 `Item` — the core entity
 
@@ -139,6 +141,35 @@ passing the row as its argument.
 re-run of `init` doesn't double-arm the loop. This is the whole "scheduler":
 no external cron required for the sweep itself.
 
+### 2.7 `DigestSchedule` + `DigestOutbox` — the digest fan-out
+
+The weekly digest is scheduled the same way the sweep is. `DigestSchedule`
+holds a repeating **weekly** timer row (armed by `init`); when it fires, the
+runtime calls `send_digest`.
+
+The key constraint is that **the wasm module has no outbound network** — it
+can't call the Discord/Telegram APIs. So the fan-out is a *queue*, not a push:
+
+1. **`send_digest`** reads every `Item` flagged `ExpiringSoon` (and in stock),
+   ranks them most-urgent-first (soonest `est_expiry_ts`, then name), renders
+   one markdown digest, and inserts **one `DigestOutbox` row per active
+   `DigestSubscription` endpoint** — the same body, one row per `(channel,
+   handle)`. Nothing expiring → no rows (cheap no-op).
+2. **`DigestOutbox`** is a durable delivery queue. Each row carries the
+   rendered `message`, the target `channel`/`handle`, and an
+   `is_delivered` flag.
+3. A **networked poller** (the Hermes gateway) reads `is_delivered = false`
+   rows, delivers each over its channel, and calls `mark_outbox_delivered` to
+   ack. Rows are *kept* (flag flipped) rather than deleted, so the outbox
+   doubles as a send log.
+
+Why per-endpoint rows instead of one row fanning out at delivery time?
+Because one failed send (e.g. a Discord rate limit) must not strand the other
+endpoints — with per-endpoint rows each delivery is independent and retries
+only the row that failed. And because it's a queue, a restart or a transient
+network blip never loses a digest: the pending row just waits for the next
+drain.
+
 ## 3. Enums
 
 - **`Location`**: `Fridge`, `Freezer`, `Pantry`, `Counter`, `Other`.
@@ -149,11 +180,11 @@ no external cron required for the sweep itself.
   comparison (used by the digest to rank items). `ExpiringSoon` is set by the
   `sweep_expiring_items` scheduled reducer (§2.6), not by ingestion.
 
-## 4. Reducers (19)
+## 4. Reducers (21)
 
 | Area | Reducer | Notes |
 |---|---|---|
-| init | `init` | Logs startup; arms the 30-min `ExpirySweepSchedule` loop (idempotent). |
+| init | `init` | Logs startup; arms the 30-min `ExpirySweepSchedule` + weekly `DigestSchedule` loops (idempotent). |
 | user | `client_connected` (init hook) | Auto-creates/activates `User` on connect. |
 | | `set_user_name` | |
 | items | `add_item` | Fuzzy-merge or create. The workhorse. |
@@ -171,6 +202,8 @@ no external cron required for the sweep itself.
 | | `remove_shopping_item` | |
 | digest | `subscribe_digest` | Upsert on (identity, channel, handle). |
 | | `unsubscribe_digest` | Soft-disable by `subscription_id`. |
+| | `send_digest` | **Scheduled (weekly).** Ranks `ExpiringSoon` items, renders the digest, fans one `DigestOutbox` row per active endpoint. Also callable on demand. |
+| | `mark_outbox_delivered` | Ack an outbox row after the gateway sends it (doubles as a send log). |
 | expiry | `sweep_expiring_items` | **Scheduled.** 30-min loop; promotes items within the warn window to `ExpiringSoon` + logs. Also callable on demand. |
 
 **Reducer return types:** In SpacetimeDB 2.x a reducer must return `()` or
@@ -193,8 +226,12 @@ clients already have via pub/sub.
    (purchase date + shelf life). The `sweep_expiring_items` scheduled
    reducer (30-min loop, §2.6) promotes items to `ExpiringSoon` and the
    digest reads the column directly — no recompute per read.
-4. **Digest subscriptions are data, not code.** Adding an endpoint = a row.
-   The job fans out to every active `(channel, handle)`.
+4. **Digest fan-out is a queue, not a push.** The wasm module has no
+   outbound network, so `send_digest` (weekly, scheduled) composes the digest
+   and writes one `DigestOutbox` row per active `DigestSubscription` endpoint.
+   A networked poller (the Hermes gateway) drains `is_delivered = false` rows
+   and calls `mark_outbox_delivered`. Adding an endpoint = a subscription row,
+   not a deploy; a failed delivery leaves its row pending until the next drain.
 5. **Everything is public.** All tables are `public` (readable by any
    connected member of the household). Write access is gated by auth
    (any authenticated member can call reducers). A private household DB
@@ -216,12 +253,13 @@ clients already have via pub/sub.
 - **No soft-delete / history on `Item`.** Depletion sets status; hard
   delete is `remove_item`. A full item history can be derived from
   `PantryEvent` if needed.
-- **Expiry sweep is wired, but notifications aren't yet.** The
-  `sweep_expiring_items` scheduled reducer (30-min loop) promotes items to
-  `ExpiringSoon` and logs a `PantryEvent`. The *next* glue is the digest
-  job that reads those flagged items + active `DigestSubscription`s and
-  actually fans out a message to each Discord/Telegram handle — the sweep
-  marks the flag, the digest delivers it.
+- **Digest is composed + queued in-module; the *send* lives in the gateway.**
+  `send_digest` (weekly, scheduled) ranks `ExpiringSoon` items and writes one
+  `DigestOutbox` row per active `DigestSubscription` endpoint, but the wasm
+  module can't make outbound network calls. The Hermes gateway must poll the
+  outbox (`is_delivered = false`), deliver over Discord/Telegram/WhatsApp, and
+  ack via `mark_outbox_delivered`. That drain loop is the last remaining glue —
+  it's a small poller in the networked gateway, not a schema change.
 
 ## 7. Build & verify
 
