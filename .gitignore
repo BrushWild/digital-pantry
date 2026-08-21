@@ -1,0 +1,25 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Node (future WASM client)
+node_modules/
+dist/
+
+# SpacetimeDB
+spacetime/
+
+# Local config & secrets
+.env
+*.local
+config.local.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+/tmp/
+*.log
