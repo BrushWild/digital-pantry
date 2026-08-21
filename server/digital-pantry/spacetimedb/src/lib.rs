@@ -1,4 +1,4 @@
-use spacetimedb::{log, reducer, table, Identity, ReducerContext, SpacetimeType, Table, Timestamp};
+use spacetimedb::{log, reducer, table, Identity, ReducerContext, ScheduleAt, SpacetimeType, Table, Timestamp};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -30,6 +30,12 @@ pub enum ItemStatus {
 impl Default for ItemStatus {
     fn default() -> Self { ItemStatus::Unopened }
 }
+
+/// How far ahead of expiry an item is flagged "expiring soon" (seconds).
+/// An item is promoted to `ExpiringSoon` when it is within this window of its
+/// `est_expiry_ts` — which also covers items that have already passed expiry
+/// (their `est_expiry_ts - now` is negative, hence `<=` the window).
+const EXPIRY_WARN_SECS: i64 = 3 * 86_400; // 3 days
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tables
@@ -277,13 +283,48 @@ pub struct PantryEvent {
     pub created_at: Timestamp,
 }
 
+/// Scheduling table for the "expiring soon" sweep.
+///
+/// A row here is a timer: when `scheduled_at` fires, SpacetimeDB calls the
+/// `sweep_expiring_items` reducer with this row as its argument. A
+/// `ScheduleAt::Interval` row fires *repeatedly* (every interval); a
+/// `ScheduleAt::Time` row fires *once* at that timestamp.
+///
+/// We start a 30-minute loop from `init`. Because the sweep reducer is also a
+/// normal reducer, it can be called manually by a client for an on-demand sweep.
+#[derive(Clone)]
+#[table(accessor = expiry_sweep_schedule, scheduled(sweep_expiring_items))]
+pub struct ExpirySweepSchedule {
+    /// 0 = repeating interval row (created once by init); non-zero = one-shot.
+    #[primary_key]
+    #[auto_inc]
+    pub scheduled_id: u64,
+    /// When the sweep should run (interval or one-shot time).
+    pub scheduled_at: ScheduleAt,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Reducers
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[reducer(init)]
-pub fn init(_ctx: &ReducerContext) {
+pub fn init(ctx: &ReducerContext) {
     log::info!("Digital Pantry SpacetimeDB module initialized.");
+    // Start the "expiring soon" sweep: a repeating 30-minute loop.
+    // Inserting a row into the scheduled table is what actually arms the timer,
+    // and doing it in init keeps it transactional with module startup.
+    //
+    // We guard against a pre-existing row (init can re-run on redeploy) so we
+    // don't arm a second overlapping loop.
+    let already_armed: Vec<ExpirySweepSchedule> = ctx.db.expiry_sweep_schedule().iter().collect();
+    if already_armed.is_empty() {
+        let interval = std::time::Duration::from_secs(30 * 60); // 30 minutes
+        ctx.db.expiry_sweep_schedule().insert(ExpirySweepSchedule {
+            scheduled_id: 0, // 0 = repeating interval
+            scheduled_at: interval.into(),
+        });
+        log::info!("Armed expiry sweep: every 30 minutes.");
+    }
 }
 
 // ── User ─────────────────────────────────────────────────────────────────────
@@ -736,6 +777,65 @@ pub fn unsubscribe_digest(ctx: &ReducerContext, subscription_id: u64) -> Result<
         ..sub
     });
     Ok(())
+}
+
+// ── Expiry sweep (scheduled) ─────────────────────────────────────────────────
+
+/// Scheduled sweep that promotes items to `ExpiringSoon`.
+///
+/// Runs on a 30-minute interval (armed from `init` via `ExpirySweepSchedule`).
+/// For every item that is still in stock with a known expiry, if it is within
+/// `EXPIRY_WARN_SECS` of expiring (or already past expiry), and it is not
+/// already flagged, promote it and log the transition.
+///
+/// Idempotent: once an item is `ExpiringSoon`, the `status < ExpiringSoon`
+/// check stops it being re-flagged. Depleted items are skipped, so the flag
+/// never clutters the list of things already gone.
+///
+/// Because this is also a normal reducer, a client can call it directly to force
+/// an on-demand sweep (e.g. a "refresh" button in the UI).
+#[reducer]
+pub fn sweep_expiring_items(
+    ctx: &ReducerContext,
+    _arg: ExpirySweepSchedule,
+) {
+    let now = now_ts(ctx);
+    let mut promoted = 0usize;
+    for item in ctx.db.item().iter() {
+        // Only consider items still in stock, not already flagged, with a
+        // known expiry. `status < ExpiringSoon` is true only for Unopened/Opened
+        // (enum derives Ord in declaration order).
+        if item.quantity > 0.0
+            && item.est_expiry_ts > 0
+            && item.status < ItemStatus::ExpiringSoon
+        {
+            let secs_to_expiry = item.est_expiry_ts - now;
+            if secs_to_expiry <= EXPIRY_WARN_SECS {
+                let display = item.display_name.clone();
+                let status = ItemStatus::ExpiringSoon;
+                ctx.db.item().item_id().update(Item {
+                    status,
+                    updated_at: ctx.timestamp,
+                    ..item
+                });
+                let days_left = (secs_to_expiry / 86_400).max(0);
+                log_event(
+                    ctx,
+                    "item_expiring_soon",
+                    item.item_id,
+                    if secs_to_expiry <= 0 {
+                        format!("'{}' has passed its estimated expiry", display)
+                    } else {
+                        format!("'{}' expires in ~{} day(s)", display, days_left)
+                    },
+                );
+                promoted += 1;
+            }
+        }
+    }
+    if promoted > 0 {
+        log::info!("Expiry sweep: promoted {} item(s) to ExpiringSoon.", promoted);
+    }
 }
 
 // ── Events (internal helper) ─────────────────────────────────────────────────

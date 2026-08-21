@@ -1,8 +1,8 @@
 # Digital Pantry — SpacetimeDB Schema
 
-> **Status:** Draft v1 (compiles clean for `wasm32-unknown-unknown`, SDK 2.1.0)
+> **Status:** Draft v1 (compiles clean for `wasm32-unknown-unknown`; `spacetimedb = "2.1.0"` pin resolves to 2.8.2)
 > **Source of truth:** `server/digital-pantry/spacetimedb/src/lib.rs`
-> **Last updated:** 2026-08-21
+> **Last updated:** 2026-08-21 — expiry sweep wired (scheduled `sweep_expiring_items`, 30-min loop)
 
 This document explains *what* the schema contains and *why* each design choice
 was made. The Rust module is the authoritative definition — if they disagree,
@@ -24,14 +24,14 @@ either surface propagates to the other instantly — no sync layer needed.
 │ (WASM)      │   reducers    │   SpacetimeDB module     │
 └─────────────┘               │   digital_pantry          │
 ┌─────────────┐   subscribe   │  ┌────────────────────┐  │
-│  Hermes     │◄─────────────►│  │ 9 public tables    │  │
+│  Hermes     │◄─────────────►│  │ 10 public tables   │  │
 │  gateway    │   reducers    │  └────────────────────┘  │
-│ (Discord /  │               │   18 reducers            │
+│ (Discord /  │               │   19 reducers            │
 │  Telegram)  │               └──────────────────────────┘
 └─────────────┘
 ```
 
-## 2. Tables (9)
+## 2. Tables (10)
 
 | Table | PK | Role |
 |---|---|---|
@@ -44,6 +44,7 @@ either surface propagates to the other instantly — no sync layer needed.
 | `ShoppingListItem` | `shopping_item_id` (auto) | Reverse shopping list. |
 | `DigestSubscription` | `subscription_id` (auto) | Per-endpoint weekly-digest subscriptions. |
 | `PantryEvent` | `event_id` (auto) | Append-only audit trail + analytics source. |
+| `ExpirySweepSchedule` | `scheduled_id` (auto) | SpacetimeDB timer table that drives the "expiring soon" sweep. |
 
 ### 2.1 `Item` — the core entity
 
@@ -121,6 +122,23 @@ the actor, and a timestamp. This powers the audit trail *and* is the
 analytics source (waste rate, spending, what's actually getting eaten).
 `log_event` is an internal helper (not a reducer) so reducers stay small.
 
+### 2.6 `ExpirySweepSchedule` — the timer table
+
+SpacetimeDB schedules reducers by watching a dedicated table. Each row is a
+timer: when `scheduled_at` fires, the runtime calls `sweep_expiring_items`,
+passing the row as its argument.
+
+- `scheduled_id` — auto-increment id. The id **0** is the convention for a
+  *repeating interval* row; a non-zero id is a one-shot that the runtime
+  deletes after it fires.
+- `scheduled_at` — a `ScheduleAt`. Built from a `std::time::Duration` for a
+  repeating interval (`ScheduleAt::Interval`), or from a `Timestamp` for a
+  one-shot (`ScheduleAt::Time`).
+
+`init` inserts exactly one repeating row (every 30 minutes), guarded so a
+re-run of `init` doesn't double-arm the loop. This is the whole "scheduler":
+no external cron required for the sweep itself.
+
 ## 3. Enums
 
 - **`Location`**: `Fridge`, `Freezer`, `Pantry`, `Counter`, `Other`.
@@ -128,14 +146,14 @@ analytics source (waste rate, spending, what's actually getting eaten).
   a breaking schema change, so keep it stable.)
 - **`ItemStatus`**: `Unopened`, `Opened`, `ExpiringSoon`, `Depleted`.
   Derives `Ord` so "is this status more urgent than that one?" is a simple
-  comparison (used by the digest to rank items). `ExpiringSoon` is set by a
-  periodic job, not by ingestion.
+  comparison (used by the digest to rank items). `ExpiringSoon` is set by the
+  `sweep_expiring_items` scheduled reducer (§2.6), not by ingestion.
 
-## 4. Reducers (18)
+## 4. Reducers (19)
 
 | Area | Reducer | Notes |
 |---|---|---|
-| init | `init` | Logs startup. |
+| init | `init` | Logs startup; arms the 30-min `ExpirySweepSchedule` loop (idempotent). |
 | user | `client_connected` (init hook) | Auto-creates/activates `User` on connect. |
 | | `set_user_name` | |
 | items | `add_item` | Fuzzy-merge or create. The workhorse. |
@@ -153,6 +171,7 @@ analytics source (waste rate, spending, what's actually getting eaten).
 | | `remove_shopping_item` | |
 | digest | `subscribe_digest` | Upsert on (identity, channel, handle). |
 | | `unsubscribe_digest` | Soft-disable by `subscription_id`. |
+| expiry | `sweep_expiring_items` | **Scheduled.** 30-min loop; promotes items within the warn window to `ExpiringSoon` + logs. Also callable on demand. |
 
 **Reducer return types:** In SpacetimeDB 2.x a reducer must return `()` or
 `Result<(), E: Display>`. We use `Result<(), String>` everywhere for
@@ -171,9 +190,9 @@ clients already have via pub/sub.
    same normalised name and merges quantity + earliest expiry. Keeps the
    item list stable across many shopping trips.
 3. **Expiry stored, not computed.** `est_expiry_ts` is written at ingestion
-   (purchase date + shelf life). A periodic job promotes items to
-   `ExpiringSoon` and the digest reads the column directly — no recompute
-   per read.
+   (purchase date + shelf life). The `sweep_expiring_items` scheduled
+   reducer (30-min loop, §2.6) promotes items to `ExpiringSoon` and the
+   digest reads the column directly — no recompute per read.
 4. **Digest subscriptions are data, not code.** Adding an endpoint = a row.
    The job fans out to every active `(channel, handle)`.
 5. **Everything is public.** All tables are `public` (readable by any
@@ -197,9 +216,12 @@ clients already have via pub/sub.
 - **No soft-delete / history on `Item`.** Depletion sets status; hard
   delete is `remove_item`. A full item history can be derived from
   `PantryEvent` if needed.
-- **`ExpiringSoon` needs a scheduler.** A SpacetimeDB scheduled action (or
-  a Hermes cron) must periodically sweep `Item`s and flip the status.
-  Not in the module yet — that's the next piece of glue.
+- **Expiry sweep is wired, but notifications aren't yet.** The
+  `sweep_expiring_items` scheduled reducer (30-min loop) promotes items to
+  `ExpiringSoon` and logs a `PantryEvent`. The *next* glue is the digest
+  job that reads those flagged items + active `DigestSubscription`s and
+  actually fans out a message to each Discord/Telegram handle — the sweep
+  marks the flag, the digest delivers it.
 
 ## 7. Build & verify
 
