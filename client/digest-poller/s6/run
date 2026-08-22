@@ -1,0 +1,45 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# Digital Pantry digest-poller — s6 longrun service.
+#
+# Connects to the live `digital-pantry` maincloud DB over WebSocket, subscribes
+# to `digest_outbox`, delivers every pending digest to the Discord
+# Digital-Pantry thread (bot token — the bot role cannot create webhooks, and
+# a webhook URL cannot target a thread), and acks via mark_outbox_delivered.
+#
+# s6-supervise restarts the process on crash. The poller's on_connect_error
+# handler exits(1) on a dropped WS, so a network blip self-recovers.
+#
+# Env:
+#   DIGEST_POLLER_MODE  live (this service) | dry-run
+#   DISCORD_BOT_TOKEN   read from /opt/data/.env (sourced below)
+#   SPACETIMEDB_HOST / _DB_NAME default to maincloud + digital-pantry in the
+#   poller itself; the Spacetime auth token is read by the SDK from the
+#   hermes user's ~/.config/spacetime/cli.toml (HOME=/opt/data).
+
+# with-contenv repopulates HOME from /init as /root. Reset to the hermes user's
+# home so HOME-anchored state (the spacetime CLI config at
+# /opt/data/home/.config/spacetime/cli.toml) is found by the SDK.
+export HOME=/opt/data/home
+
+# Bot token for direct thread posting. /opt/data/.env is a plain KEY=VALUE file
+# without `export`, so sourcing it sets shell variables only — the poller
+# (env::var) only sees the *environment*. Export it explicitly.
+. /opt/data/.env 2>/dev/null || true
+if [ -n "${DISCORD_BOT_TOKEN:-}" ]; then
+  export DISCORD_BOT_TOKEN
+fi
+export DIGEST_POLLER_MODE="${DIGEST_POLLER_MODE:-live}"
+export SPACETIMEDB_HOST="${SPACETIMEDB_HOST:-wss://maincloud.spacetimedb.com}"
+export SPACETIMEDB_DB_NAME="${SPACETIMEDB_DB_NAME:-digital-pantry}"
+# Explicit token so the poller authenticates regardless of HOME discovery.
+CLI_TOML="$HOME/.config/spacetime/cli.toml"
+if [ -f "$CLI_TOML" ]; then
+  export SPACETIMEDB_TOKEN="$(sed -n 's/^spacetimedb_token *= *"\(.*\)"/\1/p' "$CLI_TOML")"
+fi
+
+# Log stdout+stderr to a persistent path so activity is inspectable.
+LOG_DIR="/opt/data/services/logs"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+exec /opt/data/digital-pantry/client/digest-poller/target/release/digest_poller \
+  >>"$LOG_DIR/digest-poller.log" 2>&1

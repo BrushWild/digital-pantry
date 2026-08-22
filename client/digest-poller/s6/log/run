@@ -1,0 +1,5 @@
+#!/command/with-contenv sh
+# s6 log handler for the digest-poller service.
+# s6-supervise reads stdout/stderr and pipes them to s6-log, which appends to
+# $S6_LOG/.../main.log and error.log (s6-log's standard two-file convention).
+exec s6-log -s 10M /run/service/digest-poller/log 2>&1

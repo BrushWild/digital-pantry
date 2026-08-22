@@ -74,13 +74,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return; // already delivered by someone else / a prior run
             }
 
-            // De-dupe within this process lifetime.
+            // De-dupe within this process lifetime (only ids we already
+            // delivered successfully are tracked, so failed rows can be
+            // retried).
             {
-                let mut g = deliv.lock().unwrap();
+                let g = deliv.lock().unwrap();
                 if g.contains(&row.outbox_id) {
                     return;
                 }
-                g.push(row.outbox_id);
             }
 
             println!(
@@ -88,25 +89,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 row.outbox_id, row.channel, row.handle, row.item_count, row.message
             );
 
-            if live_owned == "live" {
-                match deliver(&row.channel, &row.handle, &row.message, row.item_count) {
-                    Ok(()) => println!("[poller]   -> delivered to {} webhook", row.channel),
-                    Err(e) => eprintln!("[poller]   -> delivery failed ({e}); not acking"),
+            let delivered = match live_owned.as_str() {
+                "live" => match deliver(&row.channel, &row.handle, &row.message, row.item_count) {
+                    Ok(()) => {
+                        // Confirmed success — track it so a re-delivered insert
+                        // does not double-post within this process lifetime.
+                        deliv.lock().unwrap().push(row.outbox_id);
+                        println!("[poller]   -> delivered to {} ({})", row.channel, row.handle);
+                        true
+                    }
+                    Err(e) => {
+                        // Do NOT ack on failure: the row stays pending and is
+                        // re-delivered on the next subscription apply (WS
+                        // reconnect / process restart).
+                        eprintln!("[poller]   -> delivery failed ({e}); not acking");
+                        false
+                    }
+                },
+                _ => {
+                    println!("[poller]   -> (dry-run) would deliver to {}", row.channel);
+                    true
                 }
-            } else {
-                println!("[poller]   -> (dry-run) would deliver to {} webhook", row.channel);
-            }
+            };
 
-            // Ack: mark delivered on the server, log the completion.
-            let ack_id = row.outbox_id;
-            if let Err(e) = ctx.reducers().mark_outbox_delivered_then(ack_id, move |_rctx, res| {
-                match res {
-                    Ok(Ok(())) => println!("[poller]   -> acked mark_outbox_delivered({ack_id})"),
-                    Ok(Err(msg)) => eprintln!("[poller]   -> ack failed for {ack_id}: {msg}"),
-                    Err(int_err) => eprintln!("[poller]   -> ack internal error for {ack_id}: {int_err:?}"),
+            // Ack: mark delivered on the server, log the completion. In live
+            // mode this runs only after a confirmed delivery.
+            if delivered {
+                let ack_id = row.outbox_id;
+                if let Err(e) = ctx.reducers().mark_outbox_delivered_then(ack_id, move |_rctx, res| {
+                    match res {
+                        Ok(Ok(())) => println!("[poller]   -> acked mark_outbox_delivered({ack_id})"),
+                        Ok(Err(msg)) => eprintln!("[poller]   -> ack failed for {ack_id}: {msg}"),
+                        Err(int_err) => eprintln!("[poller]   -> ack internal error for {ack_id}: {int_err:?}"),
+                    }
+                }) {
+                    eprintln!("[poller]   -> failed to send ack for {ack_id}: {e:?}");
                 }
-            }) {
-                eprintln!("[poller]   -> failed to send ack for {ack_id}: {e:?}");
             }
         });
 
@@ -119,26 +137,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Post the digest to the channel's webhook. Discord accepts `{"content":..}`;
 /// Telegram/WhatsApp webhooks vary — generic JSON body for now, expanded per
 /// channel as each is wired.
-fn deliver(channel: &str, handle: &str, message: &str, item_count: u32) -> Result<(), reqwest::Error> {
-    let client = reqwest::blocking::Client::new();
+fn deliver(channel: &str, handle: &str, message: &str, item_count: u32) -> Result<(), Box<dyn std::error::Error>> {
     match channel {
+        // Discord: the handle is either a webhook URL or a channel/thread ID.
+        // When it's a bare ID (digits only), post via the bot token instead —
+        // this avoids needing a pre-created webhook (the bot's guild role may
+        // lack MANAGE_WEBHOOKS). Requires DISCORD_BOT_TOKEN in the env.
         "discord" => {
-            client
-                .post(handle)
-                .json(&serde_json::json!({ "content": format!("{message} ({item_count} items)") }))
-                .send()?;
+            deliver_discord(handle, message, item_count)?;
         }
         "telegram" => {
+            let client = reqwest::blocking::Client::new();
             client
                 .post(handle)
                 .json(&serde_json::json!({ "text": format!("{message} ({item_count} items)") }))
-                .send()?;
+                .send()
+                .map_err(|e| Box::new(e))?;
         }
         "whatsapp" => {
+            let client = reqwest::blocking::Client::new();
             client
                 .post(handle)
                 .json(&serde_json::json!({ "body": format!("{message} ({item_count} items)") }))
-                .send()?;
+                .send()
+                .map_err(|e| Box::new(e))?;
         }
         other => {
             eprintln!("[poller]   -> unknown channel '{other}'; skipping webhook");
@@ -146,6 +168,76 @@ fn deliver(channel: &str, handle: &str, message: &str, item_count: u32) -> Resul
     }
     Ok(())
 }
+
+/// Discord delivery: webhook URL if the handle looks like a URL, else the bot
+/// token posting to the channel/thread whose ID is the handle.
+///
+/// Returns `Err` on any non-2xx response — the caller must NOT ack a row whose
+/// delivery failed (the outbox row stays pending for a retry).
+fn deliver_discord(handle: &str, message: &str, item_count: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let body: serde_json::Value =
+        serde_json::json!({ "content": format!("{message} ({item_count} items)") });
+    let client = reqwest::blocking::Client::new();
+    if let Ok(token) = env::var("DISCORD_BOT_TOKEN") {
+        if let Ok(channel_id) = handle.parse::<u64>() {
+            let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
+            let resp = client
+                .post(&url)
+                .header("Authorization", format!("Bot {token}"))
+                .json(&body)
+                .send()
+                .map_err(|e| Box::new(e))?;
+            let status = resp.status();
+            if status.is_success() {
+                Ok(())
+            } else {
+                let text = resp.text().unwrap_or_default();
+                Err(Box::new(DeliverError(format!(
+                    "discord bot-token post to {channel_id} returned {status}: {text}"
+                ))))
+            }
+        } else {
+            // Not a bare channel ID — treat as an explicit webhook URL.
+            post_webhook(&client, handle, &body)
+        }
+    } else if let Ok(channel_id) = handle.parse::<u64>() {
+        // Bare channel ID but no bot token in the env — cannot post.
+        Err(Box::new(DeliverError(format!(
+            "DISCORD_BOT_TOKEN not set; cannot post to channel {channel_id}"
+        ))))
+    } else {
+        // Explicit webhook URL, no bot token needed.
+        post_webhook(&client, handle, &body)
+    }
+}
+
+fn post_webhook(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    body: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = client.post(url).json(body).send().map_err(|e| Box::new(e))?;
+    let status = resp.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        let text = resp.text().unwrap_or_default();
+        Err(Box::new(DeliverError(format!(
+            "webhook post to {url} returned {status}: {text}"
+        ))))
+    }
+}
+
+/// A delivery error carrying a human-readable description.
+#[derive(Debug)]
+struct DeliverError(String);
+
+impl std::fmt::Display for DeliverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for DeliverError {}
 
 #[cfg(test)]
 mod tests {
