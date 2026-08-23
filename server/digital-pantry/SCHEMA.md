@@ -2,7 +2,7 @@
 
 > **Status:** Draft v1 (compiles clean for `wasm32-unknown-unknown`; `spacetimedb = "2.1.0"` pin resolves to 2.8.2)
 > **Source of truth:** `server/digital-pantry/spacetimedb/src/lib.rs`
-> **Last updated:** 2026-08-21 — expiry sweep wired + weekly digest fan-out (scheduled `send_digest` → `DigestOutbox` queue)
+> **Last updated:** 2026-08-23 — ingest inbox + agent heartbeat (offline-safe inbound queue: `IngestInbox`, `AgentHeartbeat`, 4 reducers)
 
 This document explains *what* the schema contains and *why* each design choice
 was made. The Rust module is the authoritative definition — if they disagree,
@@ -24,14 +24,14 @@ either surface propagates to the other instantly — no sync layer needed.
 │ (WASM)      │   reducers    │   SpacetimeDB module     │
 └─────────────┘               │   digital_pantry          │
 ┌─────────────┐   subscribe   │  ┌────────────────────┐  │
-│  Hermes     │◄─────────────►│  │ 12 public tables   │  │
+│  Hermes     │◄─────────────►│  │ 14 public tables   │  │
 │  gateway    │   reducers    │  └────────────────────┘  │
-│ (Discord /  │               │   21 reducers            │
+│ (Discord /  │               │   25 reducers            │
 │  Telegram)  │               └──────────────────────────┘
 └─────────────┘
 ```
 
-## 2. Tables (12)
+## 2. Tables (14)
 
 | Table | PK | Role |
 |---|---|---|
@@ -47,6 +47,8 @@ either surface propagates to the other instantly — no sync layer needed.
 | `ExpirySweepSchedule` | `scheduled_id` (auto) | SpacetimeDB timer table that drives the "expiring soon" sweep. |
 | `DigestSchedule` | `scheduled_id` (auto) | Timer table that drives the weekly expiration digest. |
 | `DigestOutbox` | `outbox_id` (auto) | Durable per-endpoint delivery queue the gateway drains. |
+| `IngestInbox` | `ingest_id` (auto) | Durable inbound queue: user → agent ingest jobs, acked by the agent. |
+| `AgentHeartbeat` | `agent_name` | One row per agent; online/offline signal for the web UI. |
 
 ### 2.1 `Item` — the core entity
 
@@ -170,6 +172,42 @@ only the row that failed. And because it's a queue, a restart or a transient
 network blip never loses a digest: the pending row just waits for the next
 drain.
 
+### 2.8 `IngestInbox` + `AgentHeartbeat` — the offline-safe inbound path
+
+The outbox above covers the **agent → user** direction. The mirror problem is
+**user → agent**: NLP messages, receipt photos, and barcode scans all depend
+on the Hermes agent, which is a *networked gateway*, not part of the wasm
+module. If the agent is down when you submit a receipt, it's simply lost.
+`IngestInbox` + `AgentHeartbeat` close that gap with the same queue pattern:
+
+1. **`IngestInbox`** is a durable inbound queue. `submit_ingest(kind,
+   payload)` enqueues a row with `kind` (`"nlp"` | `"receipt_photo"` |
+   `"barcode"`) and the raw `payload` (message text / OCR text / barcode
+   string), `submitted_by` = the caller's identity. Rows are kept as history
+   (like the outbox), not deleted on ack.
+2. **The agent drains** rows with `is_processed = false` (e.g. on startup,
+   plus periodically while running), parses the payload, applies it via the
+   normal reducers (`add_item`, `add_receipt`, ...), then acks with
+   `mark_ingest_processed` (flips the flag, sets `processed_at`).
+3. **`mark_ingest_failed(ingest_id, error)`** records why a job didn't
+   process — the row stays `is_processed = false`, so it's retried on the
+   next drain, and `last_error` is user-facing feedback (the web UI can show
+   "queued, last attempt failed: ...").
+4. **`AgentHeartbeat`** is one row per agent (`agent_name` = PK). The agent
+   calls `agent_heartbeat` on startup, periodically (~60 s), and once with
+   `state = "offline"` on graceful shutdown. The web UI reads
+   `last_seen_at` (Unix seconds) + `state`: online only if `state =
+   "online"` AND `now - last_seen_at < threshold` (e.g. 5 min), so a crashed
+   agent still reads as offline. The UI shows "agent offline — N pending
+   ingest jobs will be processed when it reconnects" instead of silently
+   dropping submissions.
+
+**Why this design:** the wasm module can't run OCR/NLP (no network, no
+GPU, deterministic reducers only), so the agent is *required* for
+ingest — which means ingest must be as durable as the digest outbox. The
+pattern is identical to §2.7: enqueue → drain → ack, pending rows survive
+restarts and blips.
+
 ## 3. Enums
 
 - **`Location`**: `Fridge`, `Freezer`, `Pantry`, `Counter`, `Other`.
@@ -180,7 +218,7 @@ drain.
   comparison (used by the digest to rank items). `ExpiringSoon` is set by the
   `sweep_expiring_items` scheduled reducer (§2.6), not by ingestion.
 
-## 4. Reducers (21)
+## 4. Reducers (25)
 
 | Area | Reducer | Notes |
 |---|---|---|
@@ -204,6 +242,10 @@ drain.
 | | `unsubscribe_digest` | Soft-disable by `subscription_id`. |
 | | `send_digest` | **Scheduled (weekly).** Ranks `ExpiringSoon` items, renders the digest, fans one `DigestOutbox` row per active endpoint. Also callable on demand. |
 | | `mark_outbox_delivered` | Ack an outbox row after the gateway sends it (doubles as a send log). |
+| ingest | `submit_ingest` | Enqueue a user → agent ingest job (`kind` + `payload`). The inbound mirror of `DigestOutbox`. |
+| | `mark_ingest_processed` | Agent ack after processing a queued job (flag + `processed_at`). |
+| | `mark_ingest_failed` | Agent records a failure; row stays pending for retry, `last_error` is user-facing. |
+| agent | `agent_heartbeat` | Upsert `AgentHeartbeat` row: online/offline signal the web UI reads. |
 | expiry | `sweep_expiring_items` | **Scheduled.** 30-min loop; promotes items within the warn window to `ExpiringSoon` + logs. Also callable on demand. |
 
 **Reducer return types:** In SpacetimeDB 2.x a reducer must return `()` or
@@ -236,6 +278,12 @@ clients already have via pub/sub.
    connected member of the household). Write access is gated by auth
    (any authenticated member can call reducers). A private household DB
    doesn't need per-row ACLs at v1.
+6. **Inbound work is a queue, not a push.** NLP/receipt/barcode ingest
+   requires the networked agent, which can be down. `submit_ingest` →
+   `IngestInbox` (drained + acked by the agent) and `AgentHeartbeat` give
+   the same "pending rows wait for the next drain" guarantee as the
+   outbox, in the other direction (§2.8) — and the heartbeat gives the web
+   UI the signal to show "agent offline" instead of pretending to be live.
 
 ## 6. Known limitations / next steps
 

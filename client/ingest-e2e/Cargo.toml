@@ -1,0 +1,25 @@
+# Digital Pantry — ingest inbox + agent heartbeat E2E client.
+#
+# A one-shot SpacetimeDB *client* that connects to the live `digital-pantry`
+# database over WebSocket, exercises the ingest inbox + heartbeat reducers,
+# and verifies each via subscription callbacks. Exits 0 on full pass.
+#
+# Build (native, not wasm) and run:
+#   cargo build --release && ./target/release/pantry_e2e
+#
+# The generated bindings under src/bindings/ are produced by:
+#   spacetime generate digital-pantry -l rust -p <spacetimedb dir> -o src/bindings
+# Regenerate after every module schema change.
+
+[package]
+name = "pantry_e2e"
+version = "0.1.0"
+edition = "2021"
+description = "E2E verification for the Digital Pantry ingest inbox + agent heartbeat"
+
+[[bin]]
+name = "pantry_e2e"
+path = "src/main.rs"
+
+[dependencies]
+spacetimedb-sdk = "2.8.2"

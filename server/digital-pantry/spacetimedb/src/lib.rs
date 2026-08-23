@@ -291,6 +291,63 @@ pub struct DigestOutbox {
     pub created_at: Timestamp,
 }
 
+/// A queued inbound ingest job (user → agent direction). The mirror of
+/// `DigestOutbox`: because the Hermes agent (NLP parsing, receipt OCR,
+/// barcode lookup) is a *networked gateway*, not part of the wasm module,
+/// anything submitted while it is down would otherwise be lost. Clients
+/// (the web UI, or the Hermes gateway itself as a fallback when a message
+/// arrives while it's up) call `submit_ingest` to enqueue a job; the agent
+/// drains rows where `is_processed = false` (e.g. on restart) and acks with
+/// `mark_ingest_processed`. A failed job keeps `is_processed = false` with
+/// `last_error` set, so it is retried on the next drain — the same
+/// "pending rows wait for the next drain" guarantee as the outbox.
+/// `last_error` is the user-facing feedback: the web UI can show why a
+/// queued job hasn't been processed yet.
+#[derive(Clone)]
+#[table(accessor = ingest_inbox, public)]
+pub struct IngestInbox {
+    #[primary_key]
+    #[auto_inc]
+    pub ingest_id: u64,
+
+    /// Ingest kind: "nlp" | "receipt_photo" | "barcode".
+    #[index(btree)]
+    pub kind: String,
+    /// Raw payload: the NLP message text, OCR text, or barcode string.
+    pub payload: String,
+    /// Identity of the user who submitted this job.
+    pub submitted_by: Identity,
+    /// Has the agent processed (and acked) this row yet?
+    pub is_processed: bool,
+    /// Last failure reason, empty = none. A row with an error stays
+    /// `is_processed = false` and is retried on the next drain.
+    pub last_error: String,
+    pub created_at: Timestamp,
+    /// Unix timestamp (seconds) when the job was processed. 0 = not yet.
+    pub processed_at: i64,
+}
+
+/// Agent availability signal, one row per agent name. The web UI reads
+/// `last_seen_at` (Unix seconds) + `state` to decide whether to show
+/// "agent offline — N pending ingest jobs will be processed when it
+/// reconnects". The agent calls `agent_heartbeat` on startup and
+/// periodically (e.g. every 60 s) and once with `state = "offline"` on a
+/// graceful shutdown. The UI treats the agent as online when
+/// `state = "online"` AND `now - last_seen_at < threshold` (e.g. 5 min),
+/// so a crashed agent still reads as offline.
+#[derive(Clone)]
+#[table(accessor = agent_heartbeats, public)]
+pub struct AgentHeartbeat {
+    /// Stable agent name, e.g. "hermes".
+    #[primary_key]
+    pub agent_name: String,
+    /// Unix timestamp (seconds) of the last heartbeat.
+    pub last_seen_at: i64,
+    /// "online" | "offline".
+    pub state: String,
+    pub updated_at: Timestamp,
+}
+
 /// An event log entry for audit trail and analytics.
 #[derive(Clone)]
 #[table(accessor = pantry_event, public)]
@@ -921,6 +978,117 @@ pub fn mark_outbox_delivered(ctx: &ReducerContext, outbox_id: u64) -> Result<(),
             is_delivered: true,
             ..row
         });
+    }
+    Ok(())
+}
+
+// ── Ingest inbox (user → agent, offline-safe) ───────────────────────────────
+
+/// Enqueue an ingest job for the agent. The user → agent mirror of
+/// `DigestOutbox`: the Hermes agent (NLP, receipt OCR, barcode) is a
+/// networked gateway, not part of the wasm module, so anything submitted
+/// while it is down would otherwise be lost. The web UI (or the agent
+/// itself, as a fallback when a message arrives while it's up) calls this;
+/// the agent drains `is_processed = false` rows on restart and acks with
+/// `mark_ingest_processed`. Rows are *kept* (flag flipped) as history,
+/// so the inbox doubles as a send log for inbound work.
+#[reducer]
+pub fn submit_ingest(
+    ctx: &ReducerContext,
+    kind: String,
+    payload: String,
+) -> Result<(), String> {
+    if kind.is_empty() {
+        return Err("Kind is required".to_string());
+    }
+    if payload.trim().is_empty() {
+        return Err("Payload cannot be empty".to_string());
+    }
+    ctx.db.ingest_inbox().insert(IngestInbox {
+        ingest_id: 0, // auto_inc
+        kind,
+        payload,
+        submitted_by: ctx.sender(),
+        is_processed: false,
+        last_error: String::new(),
+        created_at: ctx.timestamp,
+        processed_at: 0,
+    });
+    Ok(())
+}
+
+/// Ack a processed ingest job. Called by the agent after it has parsed and
+/// applied the payload (e.g. via `add_item` / `add_receipt`). The row is
+/// kept with `is_processed = true` as a send log; `processed_at` is set to
+/// the reducer's timestamp.
+#[reducer]
+pub fn mark_ingest_processed(ctx: &ReducerContext, ingest_id: u64) -> Result<(), String> {
+    let row = ctx.db.ingest_inbox().ingest_id().find(&ingest_id)
+        .ok_or("Ingest row not found")?;
+    if !row.is_processed {
+        ctx.db.ingest_inbox().ingest_id().update(IngestInbox {
+            is_processed: true,
+            processed_at: now_ts(ctx),
+            ..row
+        });
+    }
+    Ok(())
+}
+
+/// Record a failure on an ingest job. The agent calls this when it can't
+/// parse/apply a payload (e.g. OCR garbage, ambiguous NLP match). The row
+/// stays `is_processed = false` so it is retried on the next drain;
+/// `last_error` is user-facing feedback for the web UI.
+#[reducer]
+pub fn mark_ingest_failed(
+    ctx: &ReducerContext,
+    ingest_id: u64,
+    error: String,
+) -> Result<(), String> {
+    let row = ctx.db.ingest_inbox().ingest_id().find(&ingest_id)
+        .ok_or("Ingest row not found")?;
+    ctx.db.ingest_inbox().ingest_id().update(IngestInbox {
+        last_error: error,
+        ..row
+    });
+    Ok(())
+}
+
+// ── Agent heartbeat ──────────────────────────────────────────────────────────
+
+/// Record an agent heartbeat. The agent calls this on startup, periodically
+/// (e.g. every 60 s), and once with `state = "offline"` on a graceful
+/// shutdown. The web UI treats the agent as online when `state = "online"`
+/// AND `now - last_seen_at < threshold`, so a crashed agent still reads as
+/// offline.
+#[reducer]
+pub fn agent_heartbeat(
+    ctx: &ReducerContext,
+    agent_name: String,
+    state: String,
+) -> Result<(), String> {
+    if agent_name.is_empty() {
+        return Err("Agent name cannot be empty".to_string());
+    }
+    let ts = ctx.timestamp.to_micros_since_unix_epoch() / 1_000_000;
+    let row = ctx.db.agent_heartbeats().agent_name().find(&agent_name);
+    match row {
+        Some(existing) => {
+            ctx.db.agent_heartbeats().agent_name().update(AgentHeartbeat {
+                last_seen_at: ts,
+                state,
+                updated_at: ctx.timestamp,
+                ..existing
+            });
+        }
+        None => {
+            ctx.db.agent_heartbeats().insert(AgentHeartbeat {
+                agent_name,
+                last_seen_at: ts,
+                state,
+                updated_at: ctx.timestamp,
+            });
+        }
     }
     Ok(())
 }
