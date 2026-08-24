@@ -1,0 +1,55 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# Digital Pantry ingest-poller — s6 longrun service (the agent side of the inbox).
+#
+# Connects to the live `digital-pantry` maincloud DB over WebSocket, subscribes
+# to `ingest_inbox`, and for each pending row (is_processed=false) runs the
+# handler for its kind:
+#   barcode        -> scripts/barcode_lookup.py  (Open Food Facts product lookup)
+#   receipt_photo  -> scripts/ocr_receipt.py    (RapidOCR receipt text)
+#   nlp            -> the Hermes "brain" (LLM) owns the item parse; the poller
+#                     leaves the row acked once the agent has handled it.
+# then acks via mark_ingest_processed / mark_ingest_failed. It also emits
+# agent_heartbeat every 60 s so the web UI can show "agent offline — N pending
+# jobs will be processed when it reconnects."
+#
+# s6-supervise restarts the process on crash. The poller's on_connect_error
+# handler exits(1) on a dropped WS, so a network blip self-recovers.
+#
+# Env:
+#   INGEST_POLLER_MODE      live (this service) | dry-run
+#   INGEST_POLLER_PYTHON    python interpreter for the handler scripts; defaults
+#                          to the repo .venv (below) since the system python3
+#                          lacks requests/onnxruntime/cv2/rapidocr.
+#   SPACETIMEDB_HOST / _DB_NAME default to maincloud + digital-pantry in the
+#   poller itself; the Spacetime auth token is read by the SDK from the
+#   hermes user's ~/.config/spacetime/cli.toml (HOME=/opt/data/home).
+
+# with-contenv repopulates HOME from /init as /root. Reset to the hermes user's
+# home so HOME-anchored state (the spacetime CLI config at
+# /opt/data/home/.config/spacetime/cli.toml) is found by the SDK.
+export HOME=/opt/data/home
+
+# The handler scripts (barcode_lookup.py / ocr_receipt.py) live under the repo
+# root and import packages that only the repo .venv has — pin it explicitly.
+export INGEST_POLLER_PYTHON="${INGEST_POLLER_PYTHON:-/opt/data/digital-pantry/.venv/bin/python}"
+
+export INGEST_POLLER_MODE="${INGEST_POLLER_MODE:-live}"
+export SPACETIMEDB_HOST="${SPACETIMEDB_HOST:-wss://maincloud.spacetimedb.com}"
+export SPACETIMEDB_DB_NAME="${SPACETIMEDB_DB_NAME:-digital-pantry}"
+
+# Explicit token so the poller authenticates regardless of HOME discovery.
+CLI_TOML="$HOME/.config/spacetime/cli.toml"
+if [ -f "$CLI_TOML" ]; then
+  export SPACETIMEDB_TOKEN="$(sed -n 's/^spacetimedb_token *= *"\(.*\)"/\1/p' "$CLI_TOML")"
+fi
+
+# The handler scripts are invoked as `scripts/<name>.py` (relative), so run the
+# poller from the repo root so that path resolves.
+cd /opt/data/digital-pantry || exit 1
+
+# Log stdout+stderr to a persistent path so activity is inspectable.
+LOG_DIR="/opt/data/services/logs"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+exec /opt/data/digital-pantry/client/digest-poller/target/release/ingest_poller \
+  >>"$LOG_DIR/ingest-poller.log" 2>&1

@@ -9,4 +9,9 @@ export PKG_CONFIG_PATH="$HOME/.local/openssl-dev/usr/lib/x86_64-linux-gnu/pkgcon
 export CFLAGS="-I$HOME/.local/openssl-dev/usr/include"
 export LDFLAGS="-L$HOME/.local/openssl-dev/usr/lib/x86_64-linux-gnu -lz -lzstd"
 
+# Pin the shared target dir so the binary lands at a stable path the s6 run
+# script execs (mirrors where digest-poller's binary lives). Note: the repo
+# lives at /opt/data/digital-pantry (NOT under $HOME=/opt/data/home).
+export CARGO_TARGET_DIR="/opt/data/digital-pantry/client/digest-poller/target"
+
 exec cargo build --release "$@"
