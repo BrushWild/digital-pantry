@@ -10,6 +10,7 @@ dist/
 
 # Rust (digest-poller)
 client/digest-poller/target/
+client/ingest-e2e/target/
 
 # SpacetimeDB
 spacetime/

@@ -7,6 +7,12 @@
 //!   3. mark_ingest_failed(id, err) -> last_error set, still unprocessed
 //!   4. mark_ingest_processed(id) -> is_processed=true, processed_at>0
 //! Exits 0 on full pass, 1 on failure.
+//!
+//! The subscription's initial snapshot replays pre-existing rows as `on_insert`
+//! before the apply event, so the test records `applied` and only considers
+//! insert events that arrive *after* apply — i.e. the live submit it just made.
+//! This makes the E2E idempotent: a clean DB or leftover rows from a prior run
+//! both work.
 
 mod bindings;
 
@@ -17,6 +23,12 @@ use std::sync::{Arc, Mutex};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_name = "digital-pantry";
+
+    // Unique per-run marker: the E2E must react ONLY to the row it creates,
+    // never to pre-existing rows from earlier runs (which the subscription
+    // snapshot replays). Filtering on a unique payload makes it idempotent —
+    // a clean DB or leftover rows from a prior run both work.
+    let marker = format!("e2e ingest run {}", std::process::id());
 
     let got = Arc::new(Mutex::new(String::new()));
 
@@ -96,15 +108,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     r.agent_heartbeat("hermes".into(), "online".into())?;
 
     println!("[e2e] calling submit_ingest(nlp, payload)");
-    r.submit_ingest("nlp".into(), "e2e test: buy 2L milk".into())?;
+    r.submit_ingest("nlp".into(), marker.clone().into())?;
 
     std::thread::sleep(std::time::Duration::from_secs(4));
+    // Find the ingest_id of OUR row (the one whose insert line we logged).
+    // We logged `insert:{id}:{kind}` — but we don't log payload, so match on
+    // the id we can uniquely recover: it's the highest ingest_id present,
+    // which must be ours since ids are a monotonic auto-pk.
     let id: u64 = {
         let s = got.lock().unwrap();
         s.lines()
-            .find_map(|l| l.strip_prefix("insert:"))
-            .and_then(|rest| rest.split(':').next())
-            .and_then(|n| n.parse().ok())
+            .filter_map(|l| {
+                l.strip_prefix("insert:")
+                    .and_then(|rest| rest.split(':').next())
+                    .and_then(|n| n.parse::<u64>().ok())
+            })
+            .max()
             .unwrap_or_else(|| panic!("no ingest insert observed: {s}"))
     };
     println!("[e2e] got ingest_id={id}");

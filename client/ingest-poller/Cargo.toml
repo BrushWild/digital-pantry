@@ -1,0 +1,37 @@
+# Digital Pantry — ingest drain poller (the agent side of the inbox).
+#
+# A long-lived SpacetimeDB *client* (not a server). It connects to the live
+# `digital-pantry` database over WebSocket, subscribes to `ingest_inbox`, and
+# for each *pending* row (is_processed=false) runs the real handler for its
+# kind (nlp / receipt_photo / barcode) — then acks with `mark_ingest_processed`.
+#
+# It also emits an `agent_heartbeat` on connect, periodically, and once with
+# state="offline" on graceful shutdown, so the web UI can show "agent offline".
+#
+# ## Run
+# ```sh
+# SPACETIMEDB_HOST=wss://maincloud.spacetimedb.com \
+# SPACETIMEDB_DB_NAME=digital-pantry \
+# INGEST_POLLER_MODE=dry-run \
+# cargo run --release
+# ```
+#
+# `INGEST_POLLER_MODE=dry-run` (default): log what WOULD be parsed and ack the
+# row. `live`: run the real handlers (NLP parse -> add_item, OCR -> add_receipt,
+# barcode lookup -> add_item) before acking.
+
+[package]
+name = "ingest-poller"
+version = "0.1.0"
+edition = "2021"
+description = "Drains the Digital Pantry ingest_inbox queue (agent side)"
+
+[[bin]]
+name = "ingest_poller"
+path = "src/main.rs"
+
+[dependencies]
+spacetimedb-sdk = "2.8.2"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "blocking"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
