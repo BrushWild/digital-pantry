@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#66BB6A" />
+    <meta
+      name="description"
+      content="Digital Pantry — real-time household food inventory powered by SpacetimeDB"
+    />
+    <title>Digital Pantry</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Roboto+Mono:wght@400&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🥬</text></svg>"
+    />
+    <script type="module" crossorigin src="/digital-pantry/assets/index-DQ6xU4Vr.js"></script>
+    <link rel="stylesheet" crossorigin href="/digital-pantry/assets/index-DpUNDBgg.css">
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <div class="logo">🥬</div>
+        <div class="title-block">
+          <h1>Digital Pantry</h1>
+          <div class="tagline">Live household food inventory</div>
+        </div>
+        <span id="status" class="status warn">Connecting…</span>
+      </header>
+
+      <div class="toolbar">
+        <span class="count">
+          <strong id="count">0</strong> active items
+        </span>
+        <div class="filters">
+          <button class="filter active" data-filter="all">All</button>
+          <button class="filter" data-filter="expiringsoon">Expiring</button>
+          <button class="filter" data-filter="opened">Opened</button>
+          <button class="filter" data-filter="unopened">Unopened</button>
+        </div>
+      </div>
+
+      <div id="items"></div>
+
+      <footer>
+        Powered by
+        <a href="https://spacetimedb.com" target="_blank" rel="noreferrer">SpacetimeDB</a>
+        · read-only view · changes sync in from Discord
+      </footer>
+    </div>
+  </body>
+</html>
