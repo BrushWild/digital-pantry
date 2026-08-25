@@ -127,7 +127,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let is_selftest = row.payload == selftest_payload;
-            let (ack, detail) = handle(&mode_owned, row.kind.as_str(), row.payload.as_str());
+            let (ack, detail) = handle(
+                ctx.reducers(),
+                &mode_owned,
+                row.ingest_id,
+                row.kind.as_str(),
+                row.payload.as_str(),
+            );
             if ack {
                 acked_cb.lock().unwrap().push(row.ingest_id);
             }
@@ -217,7 +223,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// dry-run: always `(true, _)` — log what WOULD happen, then ack.
 /// live: run the real handler for the kind.
-fn handle(mode: &str, kind: &str, payload: &str) -> (bool, String) {
+fn handle(
+    reducers: &RemoteReducers,
+    mode: &str,
+    ingest_id: u64,
+    kind: &str,
+    payload: &str,
+) -> (bool, String) {
     match kind {
         "barcode" => {
             if mode == "live" {
@@ -253,18 +265,15 @@ fn handle(mode: &str, kind: &str, payload: &str) -> (bool, String) {
         }
         "receipt_photo" => {
             if mode == "live" {
-                // OCR is deterministic; semantic parsing (which lines are
-                // items/prices) is the Hermes "brain" (LLM) job. Extract the
-                // text here; the agent parses it into items.
-                match run_receipt_ocr(payload) {
-                    Ok(text) => {
-                        println!("[poller]   -> live: receipt OCR produced {} lines", text.lines().count());
-                        (true, String::new())
-                    }
-                    Err(e) => (false, format!("receipt OCR failed: {e}")),
+                // Deterministic leg: OCR + line parse -> item rows (the
+                // "brain" part — per-store quirks, unit/price extraction —
+                // is skipped; see apply_receipt.py ponytail notes).
+                match run_apply_receipt(reducers, ingest_id, payload) {
+                    Ok(n) => (true, String::new()),
+                    Err(e) => (false, format!("apply_receipt failed: {e}")),
                 }
             } else {
-                println!("[poller]   -> (dry-run) would ocr_receipt({payload})");
+                println!("[poller]   -> (dry-run) would apply_receipt({payload})");
                 (true, String::new())
             }
         }
@@ -322,15 +331,61 @@ fn run_barcode_lookup(code: &str) -> Result<serde_json::Value, String> {
     serde_json::from_str(&s).map_err(|e| format!("parse barcode JSON: {e} (stdout: {s})"))
 }
 
-/// Run `scripts/ocr_receipt.py <image>` and return the raw OCR text.
-fn run_receipt_ocr(image: &str) -> Result<String, String> {
+/// Run `scripts/apply_receipt.py <image> --receipt-id <id>` and feed each
+/// parsed item row into `add_item`. Returns the number of items added.
+///
+/// ponytail: synchronous on the connection thread (same as the old OCR path);
+/// one receipt at a time is fine for a household, parallelize if receipts
+/// ever queue up.
+fn run_apply_receipt(
+    reducers: &RemoteReducers,
+    ingest_id: u64,
+    image: &str,
+) -> Result<usize, String> {
     let py = python_exe();
     let out = Command::new(&py)
-        .arg("scripts/ocr_receipt.py")
+        .arg("scripts/apply_receipt.py")
         .arg(image)
+        .arg(format!("--receipt-id={ingest_id}"))
         .output()
-        .map_err(|e| format!("spawn {py} scripts/ocr_receipt.py: {e}"))?;
+        .map_err(|e| format!("spawn {py} scripts/apply_receipt.py: {e}"))?;
     let s = String::from_utf8_lossy(&out.stdout).to_string();
-    let j: serde_json::Value = serde_json::from_str(&s).map_err(|e| format!("parse OCR JSON: {e}"))?;
-    Ok(j.get("raw_text").and_then(|v| v.as_str()).unwrap_or_default().to_string())
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("apply_receipt exit {}: {err}", out.status.code().unwrap_or(-1)));
+    }
+    let j: serde_json::Value = serde_json::from_str(&s).map_err(|e| format!("parse items JSON: {e} (stdout: {s})"))?;
+    let items = j.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    for item in &items {
+        let f = |k: &str| item.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let s = |k: &str| item.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let loc = match s("location").as_str() {
+            "Fridge" => Location::Fridge,
+            "Freezer" => Location::Freezer,
+            "Pantry" => Location::Pantry,
+            "Counter" => Location::Counter,
+            _ => Location::Other,
+        };
+        if let Err(e) = reducers.add_item(
+            s("name"),
+            s("display_name"),
+            f("quantity"),
+            s("unit"),
+            loc,
+            f("est_expiry_ts") as i64,
+            f("unopened_days") as i32,
+            f("opened_days") as i32,
+            f("price"),
+            s("currency"),
+            s("barcode"),
+            f("source_receipt_id") as u64,
+        ) {
+            return Err(format!("add_item({}): {e}", s("name")));
+        }
+    }
+    println!(
+        "[poller]   -> live: apply_receipt added {} item(s) for ingest_id={ingest_id}",
+        items.len()
+    );
+    Ok(items.len())
 }
