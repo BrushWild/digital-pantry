@@ -113,6 +113,99 @@ function render(conn: DbConnection) {
     .join('');
 }
 
+// ── Ingest panel (receipt photo → submit_ingest) ─────────────────────
+const panel = document.getElementById('ingest-panel')!;
+const fileInput = document.getElementById('ingest-file') as HTMLInputElement;
+const preview = document.getElementById('ingest-preview') as HTMLImageElement;
+const ingestStatus = document.getElementById('ingest-status')!;
+const submitBtn = document.getElementById('ingest-submit') as HTMLButtonElement;
+let pendingDataUrl: string | null = null;
+
+function setIngestStatus(text: string) {
+  ingestStatus.textContent = text;
+}
+
+function closeIngestPanel() {
+  panel.hidden = true;
+  fileInput.value = '';
+  pendingDataUrl = null;
+  preview.hidden = true;
+  preview.src = '';
+  submitBtn.hidden = true;
+  setIngestStatus('');
+}
+
+function pickPhoto(capture: boolean) {
+  // ponytail: native `capture` attribute = camera on mobile, plain picker on
+  // desktop; getUserMedia is skipped until someone needs in-page focus/zoom.
+  if (capture) fileInput.setAttribute('capture', 'environment');
+  else fileInput.removeAttribute('capture');
+  fileInput.click();
+}
+
+// ponytail: fixed 1600px long side + JPEG 0.85; add a quality/size knob if
+// payload size ever exceeds the reducer message limit.
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const scale = Math.min(1, 1600 / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext('2d')!.drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL('image/jpeg', 0.85));
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('could not read image'));
+    };
+    img.src = url;
+  });
+}
+
+document.getElementById('add-receipt')!.addEventListener('click', () => {
+  panel.hidden = !panel.hidden;
+  if (panel.hidden) closeIngestPanel();
+});
+document.getElementById('ingest-cancel')!.addEventListener('click', closeIngestPanel);
+document.getElementById('ingest-upload')!.addEventListener('click', () => pickPhoto(false));
+document.getElementById('ingest-capture')!.addEventListener('click', () => pickPhoto(true));
+fileInput.addEventListener('change', async () => {
+  const file = fileInput.files?.[0];
+  if (!file) return;
+  try {
+    pendingDataUrl = await fileToDataUrl(file);
+  } catch (e) {
+    setIngestStatus('Could not read that file: ' + (e as Error).message);
+    return;
+  }
+  preview.src = pendingDataUrl;
+  preview.hidden = false;
+  submitBtn.hidden = false;
+  setIngestStatus('Ready — hit "Submit receipt" to queue it.');
+});
+submitBtn.addEventListener('click', async () => {
+  if (!pendingDataUrl || !activeConn) return;
+  submitBtn.disabled = true;
+  setIngestStatus('Submitting…');
+  try {
+    // ponytail: generated DbView type omits `reducers` (it's a top-level
+    // connection property); cast until the bindings surface it.
+    await (activeConn as {
+      reducers: { submitIngest: (p: { kind: string; payload: string }) => Promise<void> };
+    }).reducers.submitIngest({ kind: 'receipt_photo', payload: pendingDataUrl });
+    setIngestStatus('Queued ✓ — items appear here once the agent processes the receipt.');
+    setTimeout(closeIngestPanel, 4000);
+  } catch (e) {
+    setIngestStatus('Submit failed: ' + (e as Error).message);
+  } finally {
+    submitBtn.disabled = false;
+  }
+});
+
 // ── Connect ────────────────────────────────────────────────────────────
 const conn = DbConnection.builder()
   .withUri(HOST)

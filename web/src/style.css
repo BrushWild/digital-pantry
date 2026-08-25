@@ -162,6 +162,29 @@ header {
   border-color: var(--primary);
 }
 
+/* ── Ingest panel ───────────────────────────────────────────────────── */
+.ingest-panel {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+.ingest-panel .filter {
+  margin-left: 0;
+}
+#ingest-preview {
+  max-height: 90px;
+  max-width: 180px;
+  object-fit: contain;
+  border: 1px solid var(--outline);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+#ingest-status {
+  width: 100%;
+}
+
 /* ── Item grid ──────────────────────────────────────────────────────── */
 #items {
   display: grid;
