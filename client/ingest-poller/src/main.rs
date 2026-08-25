@@ -319,6 +319,44 @@ fn python_exe() -> String {
     "python3".into()
 }
 
+/// Decodes a `data:image/...;base64,...` payload to a temp file (or passes a
+/// plain path through unchanged). The child OCR process gets a file path,
+/// never a huge argv string.
+struct TempImage {
+    path: std::path::PathBuf,
+    is_tmp: bool,
+}
+
+impl TempImage {
+    fn new(payload: &str) -> Result<Self, String> {
+        if let Some(after_prefix) = payload.strip_prefix("data:") {
+            // format: data:image/png;base64,<payload>
+            let b64 = after_prefix
+                .split(";base64,")
+                .nth(1)
+                .ok_or_else(|| "malformed data: URL (missing ';base64,')".to_string())?;
+            let bytes = base64::decode(b64).map_err(|e| format!("base64 decode: {e}"))?;
+            let path = std::env::temp_dir().join(format!("ingest-{}.png", std::process::id()));
+            std::fs::write(&path, bytes).map_err(|e| format!("write temp image: {e}"))?;
+            Ok(Self { path, is_tmp: true })
+        } else {
+            Ok(Self { path: std::path::PathBuf::from(payload), is_tmp: false })
+        }
+    }
+
+    fn path(&self) -> &str {
+        self.path.to_str().expect("valid utf-8 path")
+    }
+}
+
+impl Drop for TempImage {
+    fn drop(&mut self) {
+        if self.is_tmp {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Run `scripts/barcode_lookup.py <code>` and parse the JSON stdout.
 fn run_barcode_lookup(code: &str) -> Result<serde_json::Value, String> {
     let py = python_exe();
@@ -334,18 +372,23 @@ fn run_barcode_lookup(code: &str) -> Result<serde_json::Value, String> {
 /// Run `scripts/apply_receipt.py <image> --receipt-id <id>` and feed each
 /// parsed item row into `add_item`. Returns the number of items added.
 ///
-/// ponytail: synchronous on the connection thread (same as the old OCR path);
-/// one receipt at a time is fine for a household, parallelize if receipts
-/// ever queue up.
+/// ponytail: synchronous on the connection thread (OCR ~3s, one receipt at a
+/// time — household volume, inside the WS ping timeout); move to a worker
+/// thread if receipts ever queue.
+///
+/// data:URL payloads are decoded to a temp file before spawning: onnxruntime
+/// segfaults on interpreter startup when argv contains a ~100KB+ string
+/// (observed 2026-08-25), so the child never sees the base64 in argv.
 fn run_apply_receipt(
     reducers: &RemoteReducers,
     ingest_id: u64,
     image: &str,
 ) -> Result<usize, String> {
+    let tmp = TempImage::new(image)?;
     let py = python_exe();
     let out = Command::new(&py)
         .arg("scripts/apply_receipt.py")
-        .arg(image)
+        .arg(tmp.path())
         .arg(format!("--receipt-id={ingest_id}"))
         .output()
         .map_err(|e| format!("spawn {py} scripts/apply_receipt.py: {e}"))?;
