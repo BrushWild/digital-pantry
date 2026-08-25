@@ -10,7 +10,7 @@ extraction from a hard, noisy image.
 Usage:
     ocr_receipt.py IMAGE [--url URL] [--out FILE] [--no-preprocess]
 
-    IMAGE   local path to the receipt image (jpg/png)
+    IMAGE   local path to the receipt image (jpg/png), or a data: URL
     --url   if set, download from URL first and ignore IMAGE
     --out   write JSON to FILE instead of stdout
     --no-preprocess  skip light preprocessing (upscale/contrast)
@@ -28,11 +28,20 @@ Preprocessing (default on): images with the long side < 1200px are upscaled
 2x; auto-contrast is applied. This meaningfully helps small/blurry photos.
 """
 import argparse
+import base64
 import io
 import json
 import sys
 import time
 from pathlib import Path
+
+
+def _decode_data_url(data_url: str) -> bytes:
+    # ponytail: assumes the ;base64 marker (all browsers emit it); upgrade to
+    # a full data-URL parser if a non-base64 source ever shows up.
+    if ";base64," not in data_url:
+        raise ValueError("expected data:...;base64,<data>")
+    return base64.b64decode(data_url.split(";base64,", 1)[1])
 
 
 def load_image(path: str, url: str | None, no_preprocess: bool):
@@ -43,6 +52,8 @@ def load_image(path: str, url: str | None, no_preprocess: bool):
         r = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
         img = Image.open(io.BytesIO(r.content))
+    elif path.startswith("data:"):
+        img = Image.open(io.BytesIO(_decode_data_url(path)))
     else:
         if not Path(path).exists():
             raise FileNotFoundError(path)
