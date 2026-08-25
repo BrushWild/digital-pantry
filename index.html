@@ -20,8 +20,8 @@
       rel="icon"
       href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🥬</text></svg>"
     />
-    <script type="module" crossorigin src="/digital-pantry/assets/index-DQ6xU4Vr.js"></script>
-    <link rel="stylesheet" crossorigin href="/digital-pantry/assets/index-DpUNDBgg.css">
+    <script type="module" crossorigin src="/digital-pantry/assets/index-f3yrmxB-.js"></script>
+    <link rel="stylesheet" crossorigin href="/digital-pantry/assets/index-CO-jL60s.css">
   </head>
   <body>
     <div id="app">
@@ -44,6 +44,17 @@
           <button class="filter" data-filter="opened">Opened</button>
           <button class="filter" data-filter="unopened">Unopened</button>
         </div>
+        <button id="add-receipt" class="filter" title="Add a receipt photo">+ Receipt</button>
+      </div>
+
+      <div id="ingest-panel" class="ingest-panel" hidden>
+        <img id="ingest-preview" alt="Receipt preview" hidden />
+        <input id="ingest-file" type="file" accept="image/*" hidden />
+        <button id="ingest-upload" class="filter">Upload photo…</button>
+        <button id="ingest-capture" class="filter">Take photo</button>
+        <button id="ingest-submit" class="filter" hidden>Submit receipt</button>
+        <button id="ingest-cancel" class="filter">Close</button>
+        <div id="ingest-status" class="empty"></div>
       </div>
 
       <div id="items"></div>
@@ -51,7 +62,7 @@
       <footer>
         Powered by
         <a href="https://spacetimedb.com" target="_blank" rel="noreferrer">SpacetimeDB</a>
-        · read-only view · changes sync in from Discord
+        · add receipts from the page or Discord
       </footer>
     </div>
   </body>
