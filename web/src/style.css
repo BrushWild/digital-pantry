@@ -226,33 +226,6 @@ header {
   word-break: break-word;
 }
 
-.badge {
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  padding: 3px 8px;
-  border-radius: var(--radius-full);
-  white-space: nowrap;
-  flex-shrink: 0;
-}
-.badge-unopened {
-  background: #e3f2fd;
-  color: #1565c0;
-}
-.badge-opened {
-  background: #fff8e1;
-  color: #f57f17;
-}
-.badge-expiringsoon {
-  background: #ffebee;
-  color: #c62828;
-}
-.badge-depleted {
-  background: #eceff1;
-  color: #546e7a;
-}
-
 /* ── transitions.dev: skeleton loader and reveal ────────────────────── */
 @keyframes skeleton-shimmer {
   from { background-position: 200% 0; }
@@ -285,7 +258,7 @@ header {
   from { opacity: 0; filter: blur(4px); transform: translateY(4px); }
   to { opacity: 1; filter: blur(0); transform: none; }
 }
-.badge.swap {
+.swap {
   animation: text-swap 0.3s ease-out;
 }
 

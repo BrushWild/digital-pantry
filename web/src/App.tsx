@@ -7,6 +7,7 @@ import {
 } from 'spacetimedb/react';
 import { DbConnection, tables, reducers } from './module_bindings';
 import type { Item } from './module_bindings/types';
+import { Badge } from '@/components/ui/badge';
 
 const HOST = 'wss://maincloud.spacetimedb.com';
 const DB_NAME = 'digital-pantry';
@@ -131,9 +132,17 @@ function ItemCard({ item }: { item: ItemRow }) {
       <div className="item-head">
         <span className="item-name">{item.displayName}</span>
         {/* key=status re-runs the "text states swap" animation on change */}
-        <span key={item.status} className={`badge swap badge-${item.status.toLowerCase()}`}>
+        <Badge
+          key={item.status}
+          variant={(item.status === 'ExpiringSoon' ? 'expiring' : item.status.toLowerCase()) as
+            | 'expiring'
+            | 'opened'
+            | 'unopened'
+            | 'depleted'}
+          className="swap"
+        >
           {status}
-        </span>
+        </Badge>
       </div>
       <div className="item-meta">
         <span className="loc">{item.location}</span>
